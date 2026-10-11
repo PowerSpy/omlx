@@ -642,6 +642,7 @@ class TestUnauthenticatedInference:
             "/v1/embeddings",
             "/v1/rerank",
             "/v1/systemone",
+            "/v1/decisions",
             "/v1/responses",
             "/v1/audio/speech",
             "/tokenize",

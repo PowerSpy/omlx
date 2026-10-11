@@ -1137,6 +1137,7 @@ class BatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -1217,6 +1218,7 @@ class BatchedEngine(BaseEngine):
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: pass per-request overrides to engine

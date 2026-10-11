@@ -84,6 +84,10 @@ class SamplingParams:
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
 
+    # Logits processor that reads the logits without changing them (used by
+    # /v1/decisions). Typed as Any like compiled_grammar.
+    logits_observer: Any = None
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []

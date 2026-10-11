@@ -167,6 +167,13 @@ from .api.responses_utils import (
     normalize_response_output_to_messages,
     split_namespace_tool_name,
 )
+from .api.decisions import (
+    DecisionsRequestError,
+    decide,
+    from_systemone,
+    to_systemone,
+)
+from .api.decisions_models import DecisionRequest
 from .api.systemone_models import SystemOneRequest
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
@@ -4096,6 +4103,120 @@ async def create_systemone(
     except BaseException:
         await lease.release()
         raise
+
+
+def _is_decision_model(model: str) -> bool:
+    pool = get_engine_pool()
+    entry = pool.get_entry(pool.resolve_model_id(model, _server_state.settings_manager))
+    return entry is not None and entry.engine_type == "decision"
+
+
+@app.post("/v1/decisions")
+async def create_decisions(
+    request: DecisionRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_inference_api_key),
+):
+    """
+    Answer typed questions about an input with option probabilities.
+
+    OpenAI Decisions API compatible endpoint. Chat models answer each
+    ``predicate``, ``choice`` or ``score`` question from the next-token
+    probabilities of the option letters; decision models use their own heads.
+
+    Example request:
+    ```json
+    {
+        "model": "qwen3-8b",
+        "input": "Checkout fails for every customer since the last deploy.",
+        "questions": [
+            {"type": "predicate", "name": "urgent", "instructions": "Is this urgent?"}
+        ]
+    }
+    ```
+    """
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+    _reject_lone_surrogates(request)
+
+    # The lease keeps the model loaded from encode() to the response.
+    lease = _LLMEngineLease()
+    try:
+        if _is_decision_model(request.model):
+            engine = await get_decision_engine(request.model, lease)
+            try:
+                plan = await engine.encode(to_systemone(request))
+            except DecisionContextLengthError as e:
+                raise HTTPException(status_code=413, detail=str(e)) from e
+            except DecisionRequestError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+            async def _decide():
+                start_time = time.perf_counter()
+                result = await engine.systemone(plan)
+                return (
+                    from_systemone(request, result["answers"]),
+                    result["input_tokens"],
+                    time.perf_counter() - start_time,
+                )
+
+        else:
+            engine = await get_engine_for_model(request.model, lease=lease)
+            multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
+                engine, "supports_multimodal_fallback", False
+            )
+
+            async def _decide():
+                await _raise_if_llm_lease_abort_requested(lease)
+                start_time = time.perf_counter()
+                try:
+                    result = await decide(engine, request, multimodal)
+                except DecisionsRequestError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+                return (
+                    result["answers"],
+                    result["input_tokens"],
+                    time.perf_counter() - start_time,
+                )
+
+        return await _json_response_or_keepalive(
+            http_request, _decisions_body(request, _decide(), lease), lease=lease
+        )
+    except BaseException:
+        await lease.release()
+        raise
+
+
+async def _decisions_body(
+    request: DecisionRequest, run, lease: _LLMEngineLease
+) -> str:
+    answers, input_tokens, elapsed = await run
+    resolved_model = _serving_model_id(lease, request.model)
+    logger.info(
+        f"Decisions: model={resolved_model}, {len(request.questions)} "
+        f"questions, {input_tokens} tokens in {elapsed:.3f}s"
+    )
+    get_server_metrics().record_request_complete(
+        prompt_tokens=input_tokens,
+        completion_tokens=0,
+        cached_tokens=0,
+        prefill_duration=elapsed,
+        model_id=resolved_model,
+        request_duration=elapsed,
+    )
+    return json.dumps(
+        {
+            "object": "decision",
+            "model": request.model,
+            "answers": answers,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        },
+        ensure_ascii=False,
+    )
 
 
 # =============================================================================
