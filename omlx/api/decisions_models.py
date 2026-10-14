@@ -8,9 +8,18 @@ These models define the request schema for:
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 
 MAX_QUESTIONS = 200
+MAX_CHOICES = 255
+MAX_SCORE_LEVELS = 10
+
+
+def choice_key(value: str | bool) -> str:
+    """Text form of a choice value; booleans use their JSON spelling."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
 
 
 class DecisionInputText(BaseModel):
@@ -42,7 +51,7 @@ class DecisionInputMessage(BaseModel):
 
 
 class DecisionChoiceOption(BaseModel):
-    value: str
+    value: StrictBool | str
     description: str | None = None
 
 
@@ -66,19 +75,22 @@ class ChoiceQuestion(_QuestionBase):
     """One value out of unordered options."""
 
     type: Literal["choice"]
-    choices: list[DecisionChoiceOption] = Field(..., min_length=2)
+    choices: list[DecisionChoiceOption] = Field(
+        ..., min_length=2, max_length=MAX_CHOICES
+    )
 
     @field_validator("choices", mode="before")
     @classmethod
     def _plain_values(cls, value):
         if isinstance(value, list):
-            return [{"value": v} if isinstance(v, str) else v for v in value]
+            return [{"value": v} if isinstance(v, (str, bool)) else v for v in value]
         return value
 
     @field_validator("choices")
     @classmethod
     def _unique_values(cls, value: list[DecisionChoiceOption]):
-        if len({c.value for c in value}) != len(value):
+        # true and "true" render the same, so they count as duplicates.
+        if len({choice_key(c.value) for c in value}) != len(value):
             raise ValueError("choice values must be unique")
         return value
 
@@ -87,7 +99,9 @@ class ScoreQuestion(_QuestionBase):
     """A level on an ordered scale, indexed from 0."""
 
     type: Literal["score"]
-    levels: list[DecisionScoreLevel] = Field(..., min_length=2)
+    levels: list[DecisionScoreLevel] = Field(
+        ..., min_length=2, max_length=MAX_SCORE_LEVELS
+    )
 
     @field_validator("levels", mode="before")
     @classmethod

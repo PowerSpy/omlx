@@ -3,10 +3,16 @@
 OpenAI Decisions API on top of any chat model.
 
 Each readout renders one question after the input as a single user turn,
-lists the options under letters, and generates one token while a logits
-processor reads the next-token log-probabilities of the option letters. The
-letters are renormalized into the answer probabilities. Every readout starts
-with the same input, so the prefix cache serves it after the first readout.
+lists the options under letters, and continues an assistant reply that starts
+with ``Answer:``. Continuing the reply makes the chat template emit its own
+answer header (a closed think block, a Harmony final channel), so the next
+token is the answer letter on templates that would otherwise open reasoning
+first. A logits processor reads the next-token log-probabilities of the
+option letters while one token is generated, and the letters are renormalized
+into the answer probabilities. When the letters hold too little of the
+next-token mass the model is not answering, and the question is a refusal.
+Every readout starts with the same input, so the prefix cache serves it after
+the first readout.
 
 Decision models (Clef, OpenJev) answer through their own heads instead: the
 request is translated to a System One request and back.
@@ -27,6 +33,7 @@ from .decisions_models import (
     DecisionRequest,
     PredicateQuestion,
     ScoreQuestion,
+    choice_key,
 )
 
 LETTERS = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
@@ -35,6 +42,10 @@ PREDICATE_OPTIONS = [
     ("No", "The statement is false."),
 ]
 SCORE_SUFFIX = " Rate along the ordered levels below (lowest first)."
+ANSWER_PREFIX = "Answer:"
+# Minimum next-token probability the option letters must hold together for
+# the readout to count as an answer.
+MIN_LETTER_MASS = 0.5
 READOUT_CONCURRENCY = 8
 
 
@@ -108,7 +119,7 @@ def input_parts(request: DecisionRequest) -> list[dict]:
 def question_options(question: Any) -> tuple[str, list[tuple[str, str]]]:
     if isinstance(question, ChoiceQuestion):
         return question.instructions, [
-            (c.value, c.description or "") for c in question.choices
+            (choice_key(c.value), c.description or "") for c in question.choices
         ]
     if isinstance(question, ScoreQuestion):
         return question.instructions + SCORE_SUFFIX, [
@@ -119,12 +130,12 @@ def question_options(question: Any) -> tuple[str, list[tuple[str, str]]]:
 
 def render_question(instructions: str, options: list[tuple[str, str]]) -> str:
     lines = "\n".join(
-        f"[{LETTERS[i]}] {key}: {desc}" if desc else f"[{LETTERS[i]}] {key}"
+        f"{LETTERS[i]}. {key}: {desc}" if desc else f"{LETTERS[i]}. {key}"
         for i, (key, desc) in enumerate(options)
     )
     return (
         f"Question: {instructions}\nOptions:\n{lines}"
-        "\n\nAnswer with the letter of the best option only."
+        "\n\nReply with the letter of the best option only."
     )
 
 
@@ -136,7 +147,10 @@ def build_messages(
     else:
         texts = [p["text"] for p in parts]
         content = "\n\n".join([*texts, question_text])
-    return [{"role": "user", "content": content}]
+    return [
+        {"role": "user", "content": content},
+        {"role": "assistant", "content": ANSWER_PREFIX},
+    ]
 
 
 def option_groups(count: int) -> list[range]:
@@ -161,7 +175,14 @@ async def _readout(
     letter_ids: list[list[int]],
     instructions: str,
     options: list[tuple[str, str]],
+    require_answer: bool = True,
 ) -> _Readout:
+    """Option probabilities, or None when the model gives no letter.
+
+    ``require_answer`` applies the letter-mass check. A group readout of a
+    large choice question skips it: the model may rightly reject every
+    option in a group, and the readout over the winners still applies it.
+    """
     capture = OptionLogitsCapture(letter_ids[: len(options)])
     output = await engine.chat(
         messages=build_messages(
@@ -171,6 +192,7 @@ async def _readout(
         temperature=0.0,
         top_p=1.0,
         chat_template_kwargs={"enable_thinking": False},
+        is_partial=True,
         logits_observer=capture,
     )
     if capture.logprobs is None:
@@ -180,7 +202,10 @@ async def _readout(
     scores = np.asarray(capture.logprobs, dtype=np.float64)
     if not np.isfinite(scores).any():
         return _Readout(None, output.prompt_tokens)
-    weights = np.exp(scores - scores[np.isfinite(scores)].max())
+    top = scores[np.isfinite(scores)].max()
+    weights = np.exp(scores - top)
+    if require_answer and np.exp(top) * weights.sum() < MIN_LETTER_MASS:
+        return _Readout(None, output.prompt_tokens)
     return _Readout((weights / weights.sum()).tolist(), output.prompt_tokens)
 
 
@@ -201,6 +226,7 @@ async def _answer_question(
             letter_ids,
             instructions,
             [options[i] for i in group],
+            require_answer=len(groups) == 1,
         )
         for group in groups
     ]
@@ -275,7 +301,16 @@ async def decide(engine: Any, request: DecisionRequest, multimodal: bool) -> dic
         async with gate:
             return await answer(question)
 
-    rest = await asyncio.gather(*(gated(q) for q in request.questions[1:]))
+    tasks = [asyncio.create_task(gated(q)) for q in request.questions[1:]]
+    try:
+        rest = await asyncio.gather(*tasks)
+    except BaseException:
+        # A failed question fails the request: stop the other readouts (the
+        # engine aborts a cancelled request) before the lease is released.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     results = [first, *rest]
     return {
         "answers": [a for a, _ in results],
@@ -297,7 +332,9 @@ def to_systemone(request: DecisionRequest) -> dict:
             questions[question.name] = {
                 "type": "choice",
                 "instructions": question.instructions,
-                "criteria": {c.value: c.description for c in question.choices},
+                "criteria": {
+                    choice_key(c.value): c.description for c in question.choices
+                },
             }
         elif isinstance(question, ScoreQuestion):
             questions[question.name] = {
@@ -341,13 +378,14 @@ def from_systemone(request: DecisionRequest, answers: dict) -> list[dict]:
             )
         elif isinstance(question, ChoiceQuestion):
             probs = answer["probabilities"]
+            values = {choice_key(c.value): c.value for c in question.choices}
             result.append(
                 {
                     "type": "choice",
                     "name": question.name,
-                    "choice": answer["choice"],
+                    "choice": values[answer["choice"]],
                     "probabilities": [
-                        {"value": c.value, "probability": probs[c.value]}
+                        {"value": c.value, "probability": probs[choice_key(c.value)]}
                         for c in question.choices
                     ],
                     "confidence": answer["confidence"],

@@ -2051,7 +2051,7 @@ class TestDecisionsEndpoint:
     ]
 
     @staticmethod
-    def _letter_chat(engine):
+    def _letter_chat(engine, background=-30.0):
         import mlx.core as mx
 
         class _CharTokenizer:
@@ -2059,8 +2059,9 @@ class TestDecisionsEndpoint:
                 return [ord(c) for c in text]
 
         async def chat(messages, **kwargs):
-            logits = [0.0] * 128
+            logits = [background] * 128
             logits[ord("A")] = 1.0
+            logits[ord("B")] = 0.0
             kwargs["logits_observer"](None, mx.array([logits]))
             return MockGenerationOutput(prompt_tokens=7)
 
@@ -2087,6 +2088,24 @@ class TestDecisionsEndpoint:
         assert team["choice"] == "billing"
         assert [p["value"] for p in team["probabilities"]] == ["billing", "tech"]
         assert mock_engine_pool.release_calls == ["test-model"]
+
+    def test_decisions_without_letter_mass_is_refusal(
+        self, client, mock_llm_engine, mock_engine_pool
+    ):
+        # Most of the next-token mass sits off the letters, as on a template
+        # that opens a reasoning or channel header before the answer.
+        self._letter_chat(mock_llm_engine, background=0.0)
+        response = client.post(
+            "/v1/decisions",
+            json={
+                "model": "test-model",
+                "input": "Checkout is down",
+                "questions": self._QUESTIONS[:1],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["answers"] == [{"type": "refusal", "name": "urgent"}]
 
     def test_decisions_with_decision_model(
         self, client, mock_engine_pool, mock_decision_engine
